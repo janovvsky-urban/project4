@@ -1,0 +1,239 @@
+!pip install pandas numpy matplotlib osmnx geopandas
+!pip install -U osmnx
+import folium
+import geopandas as gpd
+import pandas as pd
+from folium.plugins import MarkerCluster, Fullscreen, MousePosition, HeatMap
+from shapely.geometry import Point
+import requests
+import json
+
+# --- 0. Data Preparation ---
+
+# Load Vologda Oblast administrative boundaries
+vologda_oblast_border = gpd.read_file('admin_level_4_35.gpkg')
+vologda_districts = gpd.read_file('admin_level_6_35.gpkg')
+vologda_roads = gpd.read_file('roads35.gpkg')
+vologda_railways = gpd.read_file('railway35.gpkg')
+vologda_polygon_border = gpd.read_file('polygon_border_35.gpkg')
+
+
+# Ensure all GeoDataFrames are in WGS84 (EPSG:4326) for Folium
+# Folium typically works with EPSG:4326 (latitude, longitude)
+target_crs = 'EPSG:4326'
+
+if vologda_oblast_border.crs != target_crs:
+    vologda_oblast_border = vologda_oblast_border.to_crs(target_crs)
+if vologda_districts.crs != target_crs:
+    vologda_districts = vologda_districts.to_crs(target_crs)
+if vologda_roads.crs != target_crs:
+    vologda_roads = vologda_roads.to_crs(target_crs)
+if vologda_railways.crs != target_crs:
+    vologda_railways = vologda_railways.to_crs(target_crs)
+if vologda_polygon_border.crs != target_crs:
+    vologda_polygon_border = vologda_polygon_border.to_crs(target_crs)
+
+
+# Load population data
+population_df = pd.read_csv('population.csv', encoding='cp1251', sep=';')
+
+# The columns are already split into 'Name' and 'Population' by sep=';'
+# Convert Population to numeric, coercing errors
+population_df['Population'] = pd.to_numeric(population_df['Population'], errors='coerce')
+
+
+# Geocoding function (using Nominatim as an example)
+def geocode_location(location_name):
+    url = f"https://nominatim.openstreetmap.org/search?q={location_name}, Россия&format=json&limit=1" # Changed to search within Russia
+    headers = {'User-Agent': 'MapProject/1.0 (your_email@example.com)'} # Replace with your email
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        if data:
+            return float(data[0]['lat']), float(data[0]['lon'])
+    return None, None
+
+# Geocode district centers
+district_centers = [
+    "Бабаево", "Село имени Бабушкина", "Белозерск", "Великий Устюг", "Верховажье",
+    "Вожега", "Вологда", "Вытегра", "Грязовец", "Кадуй", "Кичменгский Городок",
+    "Липин Бор", "Нюксеница", "Сокол (город)", "Сямжа", "Тарногский Городок",
+    "Тотьма", "Устье (Усть-Кубинский район)", "Устюжна", "Харовск", "Чагода",
+    "Череповец", "Шексна (Шекснинский район)", "Шуйское (Вологодская область)"
+]
+
+district_center_points = []
+for center in district_centers:
+    lat, lon = geocode_location(center)
+    if lat and lon:
+        point = Point(lon, lat)
+        district_center_points.append({'name': center, 'geometry': point})
+district_center_gdf = gpd.GeoDataFrame(district_center_points, crs=target_crs)
+
+
+# Prepare population data for choropleth
+# Merge population data with district boundaries
+# Assuming 'name' in vologda_districts corresponds to 'Name' in population_df
+vologda_districts_with_pop = vologda_districts.merge(
+    population_df,
+    left_on='name',
+    right_on='Name',
+    how='left'
+)
+# Handle potential NaN values for population and calculate density if needed.
+# For simplicity, if population is NaN, it will be treated as missing in the choropleth.
+# It's recommended to preprocess population data to ensure it's numeric and clean.
+vologda_districts_with_pop['Population'] = pd.to_numeric(vologda_districts_with_pop['Population'], errors='coerce')
+vologda_districts_with_pop['Area_sqkm'] = vologda_districts_with_pop.geometry.area / 10**6
+
+# Анализ участников Ассоциации самых красивых деревень и городков России в Вологодской области
+askdr_df = pd.read_csv('askdr.csv', encoding='cp1251', sep=';')
+askdr_points = []
+
+vologda_border_polygon = vologda_polygon_border.geometry.unary_union
+
+for index, row in askdr_df.iterrows():
+    address = row['Address']
+    lat, lon = geocode_location(address)
+    if lat and lon:
+        point = Point(lon, lat)        if vologda_border_polygon.contains(point):
+            askdr_points.append({'Address': address, 'geometry': point})
+
+if askdr_points:
+    askdr_gdf = gpd.GeoDataFrame(askdr_points, crs=target_crs)
+else:
+    askdr_gdf = gpd.GeoDataFrame(columns=['Address', 'geometry'], geometry='geometry', crs=target_crs)
+    print("No ASKD participant addresses were successfully geocoded within Vologda Oblast.")
+
+
+# Подготовка данных для хитмапа
+heatmap_data = []
+for idx, row in vologda_roads.iterrows():
+    if row.geometry.geom_type == 'LineString':
+        for coord in row.geometry.coords:
+            heatmap_data.append([coord[1], coord[0]]) 
+    elif row.geometry.geom_type == 'MultiLineString':
+        for linestring in row.geometry.geoms:
+            for coord in linestring.coords:
+                heatmap_data.append([coord[1], coord[0]])
+
+map_center = vologda_oblast_border.geometry.centroid.iloc[0]
+m = folium.Map(
+    location=[map_center.y, map_center.x],
+    zoom_start=7,
+    tiles="OpenStreetMap",
+    control_scale=True
+)
+
+# Добавление слоя с границей Вологодской области
+folium.GeoJson(
+    vologda_oblast_border,
+    name='Граница Вологодской области',
+    style_function=lambda x: {
+        'color': 'grey',
+        'weight': 5,
+        'dashArray': '10, 10', # Dashed line
+        'fillOpacity': 0
+    }
+).add_to(m)
+
+# Добавление границ муниципальных образований
+folium.GeoJson(
+    vologda_districts,
+    name='Границы районов/округов',
+    style_function=lambda x: {
+        'color': 'black',
+        'weight': 1,
+        'fillOpacity': 0.1
+    },
+    tooltip=folium.GeoJsonTooltip(
+        fields=['name'], # Corrected to 'name'
+        aliases=['Район/Округ:'],
+        localize=True
+    )
+).add_to(m)
+
+# Добавление слоя с автодорогами
+folium.GeoJson(
+    vologda_roads,
+    name='Автодороги',
+    style_function=lambda x: {
+        'color': 'yellow',
+        'weight': 2,
+        'fillOpacity': 0
+    }
+).add_to(m)
+
+# Создание слоя с железными дорогами
+folium.GeoJson(
+    vologda_railways,
+    name='Железные дороги',
+    style_function=lambda x: {
+        'color': 'darkred', 
+        'weight': 2,
+        'dashArray': '5, 5', 
+        'fillOpacity': 0
+    }
+).add_to(m)
+
+# Создание карты центров муниципальных образований
+district_centers_group = folium.FeatureGroup(name='Райцентры').add_to(m)
+for idx, row in district_center_gdf.iterrows():
+    folium.CircleMarker(
+        location=[row.geometry.y, row.geometry.x],
+        radius=3,
+        color='black',
+        fill=True,
+        fill_color='black',
+        fill_opacity=1,
+        tooltip=row['name']
+    ).add_to(district_centers_group)
+
+
+# Создание картограммы с численностью населения в муниципальных образованиях Вологодской области
+vologda_districts_with_pop['Population_clean'] = vologda_districts_with_pop['Population'].fillna(0) # Fill NaN with 0 for choropleth
+folium.Choropleth(
+    name='Численность населения по районам',
+    geo_data=vologda_districts_with_pop,
+    data=vologda_districts_with_pop,
+    columns=['name', 'Population_clean'], 
+    key_on='feature.properties.name',
+    fill_opacity=0.7,
+    line_opacity=0.2,
+    legend_name='Численность населения',
+    highlight=True,
+    tooltip=folium.GeoJsonTooltip(
+        fields=['name', 'Population'],
+        aliases=['Район/Округ:', 'Население:'],
+        localize=True
+    )
+).add_to(m)
+
+# Создание карты участников АСКДР в Вологодской области
+if not askdr_gdf.empty:
+    askdr_marker_cluster = MarkerCluster(name='Участники АСКДР').add_to(m)
+    for idx, row in askdr_gdf.iterrows():
+        folium.Marker(
+            location=[row.geometry.y, row.geometry.x],
+            popup=row['Address'],
+            icon=folium.Icon(icon='info-sign', color='blue')
+        ).add_to(askdr_marker_cluster)
+else:
+    print("No ASKD participants within Vologda Oblast to display on the map.")
+
+# Добавление тепловой карты
+HeatMap(heatmap_data, name='Плотность автодорог').add_to(m)
+
+# Добавление плагинов
+folium.LayerControl().add_to(m)
+MousePosition().add_to(m)
+Fullscreen(
+    position="bottomright",
+    title="Expand me",
+    title_cancel="Exit me",
+    force_separate_button=True,
+).add_to(m)
+
+# Сохранение карты
+m.save("index.html")
+print("Карта загружена")
